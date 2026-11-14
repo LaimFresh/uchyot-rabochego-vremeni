@@ -334,7 +334,7 @@ function renderAdmin() {
             <div><h2 id="presence-title">Кто сейчас на базе</h2><p>Все открытые смены обновляются автоматически.</p></div>
             <span class="count-label">${rows.length} ${pluralPeople(rows.length)}</span>
           </div>
-          ${rows.length ? `<div class="presence-table"><div class="table-header"><span>Сотрудник</span><span>Статус</span><span>Смена</span><span>Работа</span><span>Перерыв / сон</span></div>${rows.map(renderPresenceRow).join('')}</div>` : renderEmptyPresence()}
+          ${rows.length ? `<div class="presence-table presence-table-desktop"><div class="table-header"><span>Сотрудник</span><span>Статус</span><span>Смена</span><span>Работа</span><span>Перерыв / сон</span></div>${rows.map(renderPresenceRow).join('')}</div><div class="presence-mobile-list">${rows.map(renderPresenceMobileCard).join('')}</div>` : renderEmptyPresence()}
         </section>
         <section class="dashboard-card activity-card" aria-labelledby="activity-title">
           <div class="section-heading"><div><h2 id="activity-title">Последние смены</h2><p>Закрытые смены за сегодня.</p></div></div>
@@ -352,6 +352,7 @@ function renderAdmin() {
             <tbody>${data.employees.map(renderEmployeeRow).join('')}</tbody>
           </table>
         </div>
+        <div class="employees-mobile-list">${data.employees.map(renderEmployeeMobileCard).join('')}</div>
       </section>
       ${state.employeeEditor ? renderEmployeeModal(state.employeeEditor) : ''}
     </section>
@@ -363,7 +364,11 @@ function metricCard(label, value, description, tone) {
 }
 
 function renderPresenceRow({ shift, employee, totals, status }) {
-  return `<div class="presence-row"><div class="person-cell"><span class="avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><small>с ${formatTime(shift.startAt)}</small></div></div><div><span class="status-pill ${status}"><i>${statusIcon(status)}</i>${statusLabel(status)}</span></div><strong>${formatDuration(durationMs(shift.startAt))}</strong><div class="split-time"><span><i class="summary-dot break"></i><b data-shift-break="${shift.id}">${formatDuration(totals.break)}</b></span><span><i class="summary-dot sleep"></i><b data-shift-sleep="${shift.id}">${formatDuration(totals.sleep)}</b></span></div></div>`;
+  return `<div class="presence-row"><div class="person-cell"><span class="avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><small>с ${formatTime(shift.startAt)}</small></div></div><div><span class="status-pill ${status}"><i>${statusIcon(status)}</i>${statusLabel(status)}</span></div><strong data-shift-total="${shift.id}">${formatDuration(durationMs(shift.startAt))}</strong><strong data-shift-work="${shift.id}">${formatDuration(totals.work)}</strong><div class="split-time"><span><i class="summary-dot break"></i><b data-shift-break="${shift.id}">${formatDuration(totals.break)}</b></span><span><i class="summary-dot sleep"></i><b data-shift-sleep="${shift.id}">${formatDuration(totals.sleep)}</b></span></div></div>`;
+}
+
+function renderPresenceMobileCard({ shift, employee, totals, status }) {
+  return `<article class="presence-mobile-card"><div class="mobile-card-heading"><div class="person-cell"><span class="avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><small>Смена с ${formatTime(shift.startAt)}</small></div></div><span class="status-pill ${status}"><i>${statusIcon(status)}</i>${statusLabel(status)}</span></div><div class="mobile-time-grid"><div><span>В смене</span><strong data-shift-total="${shift.id}">${formatDuration(durationMs(shift.startAt))}</strong></div><div><span>Работа</span><strong data-shift-work="${shift.id}">${formatDuration(totals.work)}</strong></div><div><span><i class="summary-dot break"></i>Перерыв</span><strong data-shift-break="${shift.id}">${formatDuration(totals.break)}</strong></div><div><span><i class="summary-dot sleep"></i>Сон</span><strong data-shift-sleep="${shift.id}">${formatDuration(totals.sleep)}</strong></div></div></article>`;
 }
 
 function renderEmptyPresence() {
@@ -392,6 +397,12 @@ function pluralPeople(number) {
 function renderEmployeeRow(employee) {
   const openShift = getOpenShift(employee.id);
   return `<tr><td><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div></td><td><span class="employee-code">Не отображается</span></td><td>${openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>'}</td><td class="align-right"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></td></tr>`;
+}
+
+function renderEmployeeMobileCard(employee) {
+  const openShift = getOpenShift(employee.id);
+  const accessStatus = openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>';
+  return `<article class="employee-mobile-card"><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div><div class="employee-mobile-actions">${accessStatus}<button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></div></article>`;
 }
 
 function renderEmployeeModal(editor) {
@@ -631,10 +642,17 @@ function refreshLiveDurations() {
   if (state.view === 'admin' && state.adminAuthenticated) {
     data.shifts.filter((shift) => !shift.endAt).forEach((shift) => {
       const totals = segmentTotals(shift);
-      const breakField = document.querySelector(`[data-shift-break="${shift.id}"]`);
-      const sleepField = document.querySelector(`[data-shift-sleep="${shift.id}"]`);
-      if (breakField) breakField.textContent = formatDuration(totals.break);
-      if (sleepField) sleepField.textContent = formatDuration(totals.sleep);
+      const values = {
+        total: formatDuration(durationMs(shift.startAt)),
+        work: formatDuration(totals.work),
+        break: formatDuration(totals.break),
+        sleep: formatDuration(totals.sleep)
+      };
+      Object.entries(values).forEach(([kind, value]) => {
+        document.querySelectorAll(`[data-shift-${kind}="${shift.id}"]`).forEach((field) => {
+          field.textContent = value;
+        });
+      });
     });
   }
 }
