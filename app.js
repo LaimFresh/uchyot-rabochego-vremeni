@@ -22,7 +22,7 @@ const config = window.WORKTIME_CONFIG || {};
 const isConfigured = Boolean(config.supabaseUrl && config.supabaseAnonKey && window.supabase);
 const supabaseClient = isConfigured ? window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey) : null;
 
-let data = { employees: [], shifts: [], notepad: '', serverNow: null };
+let data = { employees: [], shifts: [], serverNow: null };
 let state = {
   view: 'terminal',
   adminAuthenticated: false,
@@ -31,10 +31,14 @@ let state = {
   closeVerification: false,
   codeValue: '',
   employeeEditor: null,
+  adminSection: 'dashboard',
   historyRows: [],
   historyLoading: false,
   historyFrom: defaultHistoryRange.from,
-  historyTo: defaultHistoryRange.to
+  historyTo: defaultHistoryRange.to,
+  notes: [],
+  notesLoading: false,
+  noteEditorId: null
 };
 
 const app = document.querySelector('#app');
@@ -154,7 +158,7 @@ function clearEmployeeSession() {
 }
 
 function isAdminView(view = state.view) {
-  return ['admin', 'history', 'notepad'].includes(view);
+  return view === 'admin';
 }
 
 function render() {
@@ -172,8 +176,6 @@ function render() {
       <nav class="topnav" aria-label="Разделы приложения">
         <button class="nav-link ${state.view === 'terminal' ? 'is-active' : ''}" data-view="terminal">Терминал</button>
         <button class="nav-link ${state.view === 'admin' ? 'is-active' : ''}" data-view="admin">Администратор</button>
-        <button class="nav-link ${state.view === 'history' ? 'is-active' : ''}" data-view="history">Смены</button>
-        <button class="nav-link ${state.view === 'notepad' ? 'is-active' : ''}" data-view="notepad">Блокнот</button>
       </nav>
       <div class="clock" aria-live="off">
         <span id="header-time">${formatTime(new Date().toISOString())}</span>
@@ -335,11 +337,20 @@ function renderCloseVerification(employee) {
 
 function renderAdminArea() {
   if (!state.adminAuthenticated) return renderAdminLogin();
-  if (state.view === 'history') return renderShiftHistory();
-  if (state.view === 'notepad') return renderNotepad();
+  if (state.adminSection === 'history') return renderShiftHistory();
+  if (state.adminSection === 'notes') return renderNotes();
   return renderAdmin();
 }
 
+function renderAdminSections() {
+  return `
+    <nav class="admin-section-nav" aria-label="Разделы администратора">
+      <button type="button" class="admin-section-link ${state.adminSection === 'dashboard' ? 'is-active' : ''}" data-action="set-admin-section" data-section="dashboard">Обзор</button>
+      <button type="button" class="admin-section-link ${state.adminSection === 'history' ? 'is-active' : ''}" data-action="set-admin-section" data-section="history">История смен</button>
+      <button type="button" class="admin-section-link ${state.adminSection === 'notes' ? 'is-active' : ''}" data-action="set-admin-section" data-section="notes">Заметки</button>
+    </nav>
+  `;
+}
 function formatHistoryDate(value) {
   const [year, month, day] = String(value).slice(0, 10).split('-').map(Number);
   return new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date(year, month - 1, day));
@@ -364,6 +375,7 @@ function renderShiftHistory() {
         <div><p class="eyebrow">Архив рабочего времени</p><h1 id="history-title">История смен</h1><p class="page-lead">Рабочее время разбито по календарным датам в часовом поясе устройства.</p></div>
         <button class="outline-button" type="button" data-action="export-history" ${rows.length ? '' : 'disabled'}>Скачать для Excel</button>
       </div>
+      ${renderAdminSections()}
       <form id="history-filter-form" class="history-filter" novalidate>
         <label>С даты<input type="date" name="from" required value="${escapeHtml(state.historyFrom)}" /></label>
         <label>По дату<input type="date" name="to" required value="${escapeHtml(state.historyTo)}" /></label>
@@ -376,6 +388,10 @@ function renderShiftHistory() {
       </div>
       <section class="history-card" aria-live="polite">
         ${state.historyLoading ? '<div class="history-empty">Загружаем историю смен…</div>' : rows.length ? renderHistoryRows(rows) : '<div class="history-empty">За выбранный период смен не найдено.</div>'}
+      </section>
+      <section class="history-cleanup" aria-labelledby="history-cleanup-title">
+        <div><h2 id="history-cleanup-title">Очистка архива</h2><p>Удаляет завершённые смены и их отрезки по выбранную дату включительно. Это действие нельзя отменить.</p></div>
+        <form id="history-cleanup-form" class="history-cleanup-form"><label>Удалить по дату<input type="date" name="through" required value="${escapeHtml(state.historyTo)}" /></label><button class="danger-button" type="submit">Удалить смены</button></form>
       </section>
     </section>
   `;
@@ -403,19 +419,45 @@ function renderHistoryRows(rows) {
   `;
 }
 
-function renderNotepad() {
+function notePreview(content) {
+  const normalized = String(content || '').replace(/\s+/g, ' ').trim();
+  return normalized.length > 64 ? `${normalized.slice(0, 64)}…` : normalized || 'Пустая заметка';
+}
+
+function formatNoteDate(value) {
+  return new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }).format(new Date(value));
+}
+
+function renderNotes() {
+  const selectedNote = state.notes.find((note) => note.id === state.noteEditorId) || null;
   return `
-    <section class="admin-page notepad-page" aria-labelledby="notepad-title">
+    <section class="admin-page notes-page" aria-labelledby="notes-title">
       <div class="admin-titlebar">
-        <div><p class="eyebrow">Общие записи</p><h1 id="notepad-title">Блокнот</h1><p class="page-lead">Короткие заметки о бронях, ценах и делах базы.</p></div>
+        <div><p class="eyebrow">Общие записи</p><h1 id="notes-title">Заметки</h1><p class="page-lead">Создавайте отдельные записи о бронях, ценах и делах базы. Ненужные записи можно удалить самостоятельно.</p></div>
       </div>
-      <form id="notepad-form" class="notepad-card">
-        <label class="sr-only" for="notepad-content">Заметка администратора</label>
-        <textarea id="notepad-content" name="content" maxlength="10000" placeholder="Например: бронь на 18 ноября, цена — 12 000 ₽.">${escapeHtml(data.notepad || '')}</textarea>
-        <div class="notepad-footer"><span>Доступно только администраторам</span><button class="primary-button" type="submit">Сохранить</button></div>
-      </form>
+      ${renderAdminSections()}
+      <section class="notes-workspace">
+        <form id="note-form" class="note-editor">
+          <div class="note-editor-heading"><div><h2>${selectedNote ? 'Изменить заметку' : 'Новая заметка'}</h2><p>До 10 000 символов в одной заметке.</p></div><button class="text-button" type="button" data-action="new-note">Новая</button></div>
+          <label class="sr-only" for="note-content">Текст заметки</label>
+          <textarea id="note-content" name="content" maxlength="10000" placeholder="Например: бронь на 18 ноября, цена — 12 000 ₽.">${escapeHtml(selectedNote?.content || '')}</textarea>
+          <div class="note-editor-actions"><span>Заметки доступны только администраторам</span><div>${selectedNote ? `<button class="danger-button compact-danger" type="button" data-action="delete-note" data-id="${selectedNote.id}">Удалить</button>` : ''}<button class="primary-button" type="submit">${selectedNote ? 'Сохранить изменения' : 'Создать заметку'}</button></div></div>
+        </form>
+        <aside class="notes-list" aria-label="Список заметок">
+          <div class="notes-list-heading"><h2>Все заметки</h2><span>${state.notes.length}</span></div>
+          <div class="notes-list-items">${state.notesLoading ? '<div class="notes-empty">Загружаем заметки…</div>' : state.notes.length ? state.notes.map(renderNoteListItem).join('') : '<div class="notes-empty">Заметок пока нет.</div>'}</div>
+        </aside>
+      </section>
     </section>
   `;
+}
+
+function renderNoteListItem(note) {
+  return `
+    <article class="note-list-item ${note.id === state.noteEditorId ? 'is-selected' : ''}">
+      <button type="button" class="note-select" data-action="edit-note" data-id="${note.id}"><strong>${escapeHtml(notePreview(note.content))}</strong><span>${formatNoteDate(note.updatedAt)}</span></button>
+      <button type="button" class="note-delete" aria-label="Удалить заметку" data-action="delete-note" data-id="${note.id}">×</button>
+    </article>`;
 }
 
 function renderAdmin() {
@@ -437,6 +479,7 @@ function renderAdmin() {
         </div>
         <div class="admin-actions"><span class="live-badge"><i></i> Онлайн</span><button class="text-button" data-action="logout-admin">Выйти</button></div>
       </div>
+      ${renderAdminSections()}
       <section class="metrics-grid" aria-label="Статистика по сотрудникам">
         ${metricCard('На базе', onBase, 'Сотрудники в рабочем режиме', 'work')}
         ${metricCard('На перерыве', onBreak, 'Перерывы идут прямо сейчас', 'break')}
@@ -511,13 +554,13 @@ function pluralPeople(number) {
 
 function renderEmployeeRow(employee) {
   const openShift = getOpenShift(employee.id);
-  return `<tr><td><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div></td><td><span class="employee-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></td><td>${openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>'}</td><td class="align-right"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></td></tr>`;
+  return `<tr><td><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div></td><td><span class="employee-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></td><td>${openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>'}</td><td class="align-right"><div class="row-actions"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button><button type="button" class="row-action destructive-action" data-action="delete-employee" data-id="${employee.id}">Удалить</button></div></td></tr>`;
 }
 
 function renderEmployeeMobileCard(employee) {
   const openShift = getOpenShift(employee.id);
   const accessStatus = openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>';
-  return `<article class="employee-mobile-card"><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><span class="employee-code mobile-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></div></div><div class="employee-mobile-actions">${accessStatus}<button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></div></article>`;
+  return `<article class="employee-mobile-card"><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><span class="employee-code mobile-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></div></div><div class="employee-mobile-actions">${accessStatus}<div class="row-actions"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button><button type="button" class="row-action destructive-action" data-action="delete-employee" data-id="${employee.id}">Удалить</button></div></div></article>`;
 }
 
 function renderEmployeeModal(editor) {
@@ -540,7 +583,7 @@ function renderEmployeeModal(editor) {
           <div class="form-grid"><label>Имя<input name="firstName" maxlength="40" required value="${escapeHtml(employee.firstName)}" /></label><label>Фамилия<input name="lastName" maxlength="40" required value="${escapeHtml(employee.lastName)}" /></label></div>
           <label>Индивидуальный код<input name="code" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" minlength="4" ${isNew ? 'required' : ''} placeholder="Например, 2404" value="${escapeHtml(employee.code || '')}" /><small>${codeHelp}</small></label>
           <label class="checkbox-label"><input name="active" type="checkbox" ${employee.active ? 'checked' : ''} /><span>Сотрудник может открывать смены</span></label>
-          <div class="modal-actions"><button type="button" class="outline-button" data-action="close-editor">Отмена</button><button type="submit" class="primary-button">Сохранить</button></div>
+          <div class="modal-actions">${isNew ? '' : `<button type="button" class="danger-button compact-danger" data-action="delete-employee" data-id="${employee.id}">Удалить сотрудника</button>`}<button type="button" class="outline-button" data-action="close-editor">Отмена</button><button type="submit" class="primary-button">Сохранить</button></div>
         </form>
       </section>
     </div>`;
@@ -663,22 +706,71 @@ function exportHistory() {
 async function loadShiftHistory() {
   if (!state.adminAuthenticated) return;
   state.historyLoading = true;
-  if (state.view === 'history') render();
+  if (isHistorySection()) render();
   try {
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     const rows = await rpc('admin_shift_history', { p_from: state.historyFrom, p_to: state.historyTo, p_timezone: timezone });
     state.historyRows = Array.isArray(rows) ? rows : [];
   } finally {
     state.historyLoading = false;
-    if (state.view === 'history') render();
+    if (isHistorySection()) render();
   }
 }
 
-async function saveNotepad(form) {
+function isHistorySection() {
+  return state.view === 'admin' && state.adminSection === 'history';
+}
+
+function isNotesSection() {
+  return state.view === 'admin' && state.adminSection === 'notes';
+}
+
+async function loadNotes() {
+  if (!state.adminAuthenticated) return;
+  state.notesLoading = true;
+  if (isNotesSection()) render();
+  try {
+    const notes = await rpc('admin_notes');
+    state.notes = Array.isArray(notes) ? notes : [];
+    if (!state.notes.some((note) => note.id === state.noteEditorId)) state.noteEditorId = null;
+  } finally {
+    state.notesLoading = false;
+    if (isNotesSection()) render();
+  }
+}
+
+async function saveNote(form) {
   const content = form.elements.content.value;
-  data.notepad = await rpc('save_admin_notepad', { p_content: content });
+  const note = state.noteEditorId
+    ? await rpc('update_admin_note', { p_id: state.noteEditorId, p_content: content })
+    : await rpc('create_admin_note', { p_content: content });
+  state.notes = [note, ...state.notes.filter((item) => item.id !== note.id)];
+  state.noteEditorId = note.id;
   render();
   showToast('Заметка сохранена.');
+}
+
+async function deleteNote(id) {
+  await rpc('delete_admin_note', { p_id: id });
+  state.notes = state.notes.filter((note) => note.id !== id);
+  if (state.noteEditorId === id) state.noteEditorId = null;
+  render();
+  showToast('Заметка удалена.');
+}
+
+async function deleteEmployee(id) {
+  await rpc('delete_employee', { p_id: id });
+  state.employeeEditor = null;
+  await refreshAdminData({ quiet: true });
+  showToast('Сотрудник и вся его история смен удалены.');
+}
+
+async function deleteCompletedShifts(through) {
+  const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const count = await rpc('delete_completed_shifts', { p_through: through, p_timezone: timezone });
+  await refreshAdminData({ quiet: true });
+  await loadShiftHistory();
+  showToast(count ? `Удалено завершённых смен: ${count}.` : 'Подходящих завершённых смен нет.');
 }
 
 async function refreshAdminData({ quiet = false } = {}) {
@@ -727,7 +819,8 @@ document.addEventListener('click', (event) => {
     if (isAdminView()) {
       run(async () => {
         await refreshAdminData();
-        if (state.view === 'history' && state.adminAuthenticated) await loadShiftHistory();
+        if (state.adminSection === 'history' && state.adminAuthenticated) await loadShiftHistory();
+        if (state.adminSection === 'notes' && state.adminAuthenticated) await loadNotes();
       });
     }
     if (state.view === 'terminal' && state.employeeToken) run(() => refreshEmployeeSession({ quiet: true }));
@@ -758,6 +851,30 @@ document.addEventListener('click', (event) => {
     render();
   }
   if (action === 'export-history') exportHistory();
+  if (action === 'set-admin-section') {
+    state.adminSection = button.dataset.section;
+    render();
+    if (state.adminSection === 'history') run(() => loadShiftHistory());
+    if (state.adminSection === 'notes') run(() => loadNotes());
+  }
+  if (action === 'new-note') {
+    state.noteEditorId = null;
+    render();
+  }
+  if (action === 'edit-note') {
+    state.noteEditorId = button.dataset.id;
+    render();
+  }
+  if (action === 'delete-note') {
+    const note = state.notes.find((item) => item.id === button.dataset.id);
+    if (!note || !window.confirm(`Удалить заметку «${notePreview(note.content)}» без возможности восстановления?`)) return;
+    run(() => deleteNote(note.id));
+  }
+  if (action === 'delete-employee') {
+    const employee = getEmployee(button.dataset.id);
+    if (!employee || !window.confirm(`Удалить сотрудника «${formatName(employee)}» и всю его историю смен без возможности восстановления?`)) return;
+    run(() => deleteEmployee(employee.id));
+  }
   if (action === 'logout-admin') {
     run(async () => {
       await supabaseClient.auth.signOut();
@@ -810,9 +927,19 @@ document.addEventListener('submit', (event) => {
     state.historyTo = to;
     run(() => loadShiftHistory());
   }
-  if (event.target.id === 'notepad-form') {
+  if (event.target.id === 'history-cleanup-form') {
     event.preventDefault();
-    run(() => saveNotepad(event.target));
+    const through = event.target.elements.through.value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(through)) {
+      showToast('Укажите дату для очистки.', 'error');
+      return;
+    }
+    if (!window.confirm(`Удалить все завершённые смены по ${formatHistoryDate(through)} включительно? Это действие нельзя отменить.`)) return;
+    run(() => deleteCompletedShifts(through));
+  }
+  if (event.target.id === 'note-form') {
+    event.preventDefault();
+    run(() => saveNote(event.target));
   }
   if (event.target.id === 'admin-login-form') {
     event.preventDefault();
@@ -822,7 +949,8 @@ document.addEventListener('submit', (event) => {
       const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
       if (error) throw new Error(error.message || 'Не удалось войти в панель.');
       await refreshAdminData();
-      if (state.view === 'history' && state.adminAuthenticated) await loadShiftHistory();
+      if (state.adminSection === 'history' && state.adminAuthenticated) await loadShiftHistory();
+      if (state.adminSection === 'notes' && state.adminAuthenticated) await loadNotes();
     });
   }
 });
@@ -837,7 +965,7 @@ window.setInterval(() => {
 
 window.setInterval(() => {
   if (!supabaseClient) return;
-  if (state.view === 'admin' && state.adminAuthenticated && !state.employeeEditor && !document.querySelector('input:focus')) run(() => refreshAdminData({ quiet: true }));
+  if (state.view === 'admin' && state.adminSection === 'dashboard' && state.adminAuthenticated && !state.employeeEditor && !document.querySelector('input:focus')) run(() => refreshAdminData({ quiet: true }));
   if (state.view === 'terminal' && state.employeeToken && !state.closeVerification && !document.querySelector('input:focus')) run(() => refreshEmployeeSession({ quiet: true }));
 }, 5000);
 
@@ -851,7 +979,7 @@ function refreshLiveDurations() {
     if (total) total.textContent = formatDuration(durationMs(shift.startAt));
     if (current && segment) current.textContent = formatDuration(durationMs(segment.startAt));
   }
-  if (state.view === 'admin' && state.adminAuthenticated) {
+  if (state.view === 'admin' && state.adminSection === 'dashboard' && state.adminAuthenticated) {
     data.shifts.filter((shift) => !shift.endAt).forEach((shift) => {
       const totals = segmentTotals(shift);
       const values = {
