@@ -1,11 +1,28 @@
 const EMPLOYEE_TOKEN_KEY = 'base-employee-token-v3';
 const EMPLOYEE_ID_KEY = 'base-employee-id-v3';
 
+function formatDateInput(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function previousMonthRange() {
+  const today = new Date();
+  return {
+    from: formatDateInput(new Date(today.getFullYear(), today.getMonth() - 1, 1)),
+    to: formatDateInput(new Date(today.getFullYear(), today.getMonth(), 0))
+  };
+}
+
+const defaultHistoryRange = previousMonthRange();
+
 const config = window.WORKTIME_CONFIG || {};
 const isConfigured = Boolean(config.supabaseUrl && config.supabaseAnonKey && window.supabase);
 const supabaseClient = isConfigured ? window.supabase.createClient(config.supabaseUrl, config.supabaseAnonKey) : null;
 
-let data = { employees: [], shifts: [], serverNow: null };
+let data = { employees: [], shifts: [], notepad: '', serverNow: null };
 let state = {
   view: 'terminal',
   adminAuthenticated: false,
@@ -13,7 +30,11 @@ let state = {
   employeeId: sessionStorage.getItem(EMPLOYEE_ID_KEY) || '',
   closeVerification: false,
   codeValue: '',
-  employeeEditor: null
+  employeeEditor: null,
+  historyRows: [],
+  historyLoading: false,
+  historyFrom: defaultHistoryRange.from,
+  historyTo: defaultHistoryRange.to
 };
 
 const app = document.querySelector('#app');
@@ -132,6 +153,10 @@ function clearEmployeeSession() {
   sessionStorage.removeItem(EMPLOYEE_TOKEN_KEY);
 }
 
+function isAdminView(view = state.view) {
+  return ['admin', 'history', 'notepad'].includes(view);
+}
+
 function render() {
   if (!isConfigured) {
     app.innerHTML = renderConfigurationScreen();
@@ -147,6 +172,8 @@ function render() {
       <nav class="topnav" aria-label="Разделы приложения">
         <button class="nav-link ${state.view === 'terminal' ? 'is-active' : ''}" data-view="terminal">Терминал</button>
         <button class="nav-link ${state.view === 'admin' ? 'is-active' : ''}" data-view="admin">Администратор</button>
+        <button class="nav-link ${state.view === 'history' ? 'is-active' : ''}" data-view="history">Смены</button>
+        <button class="nav-link ${state.view === 'notepad' ? 'is-active' : ''}" data-view="notepad">Блокнот</button>
       </nav>
       <div class="clock" aria-live="off">
         <span id="header-time">${formatTime(new Date().toISOString())}</span>
@@ -154,7 +181,7 @@ function render() {
       </div>
     </header>
     <div class="page-content">
-      ${state.view === 'admin' ? renderAdmin() : renderTerminal()}
+      ${isAdminView() ? renderAdminArea() : renderTerminal()}
     </div>
   `;
   bindEmployeeForm();
@@ -241,7 +268,10 @@ function renderEmployeePanel(employee) {
           <h1 id="employee-title">${escapeHtml(formatName(employee))}</h1>
           <p class="started-line">Смена начата сегодня в ${formatTime(shift.startAt)}</p>
         </div>
-        <div class="status-chip ${status}"><span aria-hidden="true">${statusIcon(status)}</span>${statusLabel(status)}</div>
+        <div class="employee-header-actions">
+          <div class="status-chip ${status}"><span aria-hidden="true">${statusIcon(status)}</span>${statusLabel(status)}</div>
+          <button class="text-button return-to-code-button" type="button" data-action="return-to-code">К вводу кода</button>
+        </div>
       </div>
       <div class="work-panel">
         <section class="main-status-card">
@@ -299,6 +329,91 @@ function renderCloseVerification(employee) {
           <button class="primary-button full-button" type="submit">Подтвердить и закрыть</button>
         </form>
       </div>
+    </section>
+  `;
+}
+
+function renderAdminArea() {
+  if (!state.adminAuthenticated) return renderAdminLogin();
+  if (state.view === 'history') return renderShiftHistory();
+  if (state.view === 'notepad') return renderNotepad();
+  return renderAdmin();
+}
+
+function formatHistoryDate(value) {
+  const [year, month, day] = String(value).slice(0, 10).split('-').map(Number);
+  return new Intl.DateTimeFormat('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' }).format(new Date(year, month - 1, day));
+}
+
+function historyTimeRange(row) {
+  if (!row.firstAt || !row.lastAt) return '—';
+  return `${formatTime(row.firstAt)} — ${formatTime(row.lastAt)}`;
+}
+
+function historyDuration(value) {
+  return formatShortDuration(Number(value) || 0);
+}
+
+function renderShiftHistory() {
+  const rows = state.historyRows;
+  const workTotal = rows.reduce((total, row) => total + (Number(row.workMs) || 0), 0);
+  const employeeCount = new Set(rows.map((row) => row.employeeId)).size;
+  return `
+    <section class="admin-page history-page" aria-labelledby="history-title">
+      <div class="admin-titlebar">
+        <div><p class="eyebrow">Архив рабочего времени</p><h1 id="history-title">История смен</h1><p class="page-lead">Рабочее время разбито по календарным датам в часовом поясе устройства.</p></div>
+        <button class="outline-button" type="button" data-action="export-history" ${rows.length ? '' : 'disabled'}>Скачать для Excel</button>
+      </div>
+      <form id="history-filter-form" class="history-filter" novalidate>
+        <label>С даты<input type="date" name="from" required value="${escapeHtml(state.historyFrom)}" /></label>
+        <label>По дату<input type="date" name="to" required value="${escapeHtml(state.historyTo)}" /></label>
+        <button class="primary-button" type="submit">Показать</button>
+      </form>
+      <div class="history-summary" aria-label="Сводка по выбранному периоду">
+        <div><span>Записей</span><strong>${rows.length}</strong></div>
+        <div><span>Сотрудников</span><strong>${employeeCount}</strong></div>
+        <div><span>Рабочее время</span><strong>${historyDuration(workTotal)}</strong></div>
+      </div>
+      <section class="history-card" aria-live="polite">
+        ${state.historyLoading ? '<div class="history-empty">Загружаем историю смен…</div>' : rows.length ? renderHistoryRows(rows) : '<div class="history-empty">За выбранный период смен не найдено.</div>'}
+      </section>
+    </section>
+  `;
+}
+
+function renderHistoryRows(rows) {
+  const renderRow = (row) => `
+    <tr>
+      <td>${formatHistoryDate(row.date)}</td>
+      <td><strong>${escapeHtml(`${row.firstName} ${row.lastName}`)}</strong></td>
+      <td>${historyTimeRange(row)}</td>
+      <td><strong class="history-work">${historyDuration(row.workMs)}</strong></td>
+      <td>${historyDuration(row.breakMs)}</td>
+      <td>${historyDuration(row.sleepMs)}</td>
+      <td>${row.shiftCount}</td>
+    </tr>`;
+  const renderMobileRow = (row) => `
+    <article class="history-mobile-row">
+      <div><strong>${escapeHtml(`${row.firstName} ${row.lastName}`)}</strong><span>${formatHistoryDate(row.date)} · ${historyTimeRange(row)}</span></div>
+      <div class="history-mobile-totals"><span>Работа <b>${historyDuration(row.workMs)}</b></span><span>Перерыв <b>${historyDuration(row.breakMs)}</b></span><span>Сон <b>${historyDuration(row.sleepMs)}</b></span></div>
+    </article>`;
+  return `
+    <div class="history-table-wrap"><table class="history-table"><thead><tr><th>Дата</th><th>Сотрудник</th><th>В смене</th><th>Работа</th><th>Перерыв</th><th>Сон</th><th>Смен</th></tr></thead><tbody>${rows.map(renderRow).join('')}</tbody></table></div>
+    <div class="history-mobile-list">${rows.map(renderMobileRow).join('')}</div>
+  `;
+}
+
+function renderNotepad() {
+  return `
+    <section class="admin-page notepad-page" aria-labelledby="notepad-title">
+      <div class="admin-titlebar">
+        <div><p class="eyebrow">Общие записи</p><h1 id="notepad-title">Блокнот</h1><p class="page-lead">Короткие заметки о бронях, ценах и делах базы.</p></div>
+      </div>
+      <form id="notepad-form" class="notepad-card">
+        <label class="sr-only" for="notepad-content">Заметка администратора</label>
+        <textarea id="notepad-content" name="content" maxlength="10000" placeholder="Например: бронь на 18 ноября, цена — 12 000 ₽.">${escapeHtml(data.notepad || '')}</textarea>
+        <div class="notepad-footer"><span>Доступно только администраторам</span><button class="primary-button" type="submit">Сохранить</button></div>
+      </form>
     </section>
   `;
 }
@@ -396,20 +511,39 @@ function pluralPeople(number) {
 
 function renderEmployeeRow(employee) {
   const openShift = getOpenShift(employee.id);
-  return `<tr><td><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div></td><td><span class="employee-code">Не отображается</span></td><td>${openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>'}</td><td class="align-right"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></td></tr>`;
+  return `<tr><td><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div></td><td><span class="employee-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></td><td>${openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>'}</td><td class="align-right"><button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></td></tr>`;
 }
 
 function renderEmployeeMobileCard(employee) {
   const openShift = getOpenShift(employee.id);
   const accessStatus = openShift ? '<span class="access-badge active">Открытая смена</span>' : employee.active ? '<span class="access-badge">Активен</span>' : '<span class="access-badge inactive">Отключён</span>';
-  return `<article class="employee-mobile-card"><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><strong>${escapeHtml(formatName(employee))}</strong></div><div class="employee-mobile-actions">${accessStatus}<button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></div></article>`;
+  return `<article class="employee-mobile-card"><div class="table-person"><span class="avatar small-avatar">${escapeHtml(employee.firstName[0] || '')}${escapeHtml(employee.lastName[0] || '')}</span><div><strong>${escapeHtml(formatName(employee))}</strong><span class="employee-code mobile-code">${employee.code ? escapeHtml(employee.code) : 'Не сохранён'}</span></div></div><div class="employee-mobile-actions">${accessStatus}<button type="button" class="row-action" data-action="edit-employee" data-id="${employee.id}">Изменить</button></div></article>`;
 }
 
 function renderEmployeeModal(editor) {
   const isNew = editor === 'new';
-  const employee = isNew ? { firstName: '', lastName: '', active: true } : getEmployee(editor);
+  const employee = isNew ? { firstName: '', lastName: '', active: true, code: '' } : getEmployee(editor);
   if (!employee) return '';
-  return `<div class="modal-backdrop" role="presentation"><section class="employee-modal" role="dialog" aria-modal="true" aria-labelledby="employee-modal-title"><button type="button" class="modal-close" aria-label="Закрыть" data-action="close-editor">×</button><p class="eyebrow">${isNew ? 'Новый доступ' : 'Данные сотрудника'}</p><h2 id="employee-modal-title">${isNew ? 'Добавить сотрудника' : 'Изменить сотрудника'}</h2><form id="employee-form"><input type="hidden" name="id" value="${isNew ? '' : employee.id}" /><div class="form-grid"><label>Имя<input name="firstName" maxlength="40" required value="${escapeHtml(employee.firstName)}" /></label><label>Фамилия<input name="lastName" maxlength="40" required value="${escapeHtml(employee.lastName)}" /></label></div><label>Индивидуальный код<input name="code" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" minlength="4" ${isNew ? 'required' : ''} placeholder="${isNew ? 'Например, 2404' : 'Новый код при необходимости'}" /><small>${isNew ? 'От 4 до 8 цифр. Сообщите его сотруднику и сохраните — в базе он хранится в защищённом виде.' : 'Оставьте пустым, чтобы сохранить текущий код. Новый код заменит старый без возможности его просмотра.'}</small></label><label class="checkbox-label"><input name="active" type="checkbox" ${employee.active ? 'checked' : ''} /><span>Сотрудник может открывать смены</span></label><div class="modal-actions"><button type="button" class="outline-button" data-action="close-editor">Отмена</button><button type="submit" class="primary-button">Сохранить</button></div></form></section></div>`;
+  const codeHelp = isNew
+    ? 'От 4 до 8 цифр. Код будет виден только в панели администратора.'
+    : employee.code
+      ? 'Код виден только администраторам. Измените его и сохраните, чтобы выдать новый.'
+      : 'Прежний код был сохранён только в защищённом виде. Укажите новый, чтобы он стал виден в панели.';
+  return `
+    <div class="modal-backdrop" role="presentation">
+      <section class="employee-modal" role="dialog" aria-modal="true" aria-labelledby="employee-modal-title">
+        <button type="button" class="modal-close" aria-label="Закрыть" data-action="close-editor">×</button>
+        <p class="eyebrow">${isNew ? 'Новый доступ' : 'Данные сотрудника'}</p>
+        <h2 id="employee-modal-title">${isNew ? 'Добавить сотрудника' : 'Изменить сотрудника'}</h2>
+        <form id="employee-form">
+          <input type="hidden" name="id" value="${isNew ? '' : employee.id}" />
+          <div class="form-grid"><label>Имя<input name="firstName" maxlength="40" required value="${escapeHtml(employee.firstName)}" /></label><label>Фамилия<input name="lastName" maxlength="40" required value="${escapeHtml(employee.lastName)}" /></label></div>
+          <label>Индивидуальный код<input name="code" inputmode="numeric" pattern="[0-9]{4,8}" maxlength="8" minlength="4" ${isNew ? 'required' : ''} placeholder="Например, 2404" value="${escapeHtml(employee.code || '')}" /><small>${codeHelp}</small></label>
+          <label class="checkbox-label"><input name="active" type="checkbox" ${employee.active ? 'checked' : ''} /><span>Сотрудник может открывать смены</span></label>
+          <div class="modal-actions"><button type="button" class="outline-button" data-action="close-editor">Отмена</button><button type="submit" class="primary-button">Сохранить</button></div>
+        </form>
+      </section>
+    </div>`;
 }
 
 function renderAdminLogin() {
@@ -494,7 +628,57 @@ async function saveEmployee(form) {
   state.adminAuthenticated = true;
   state.employeeEditor = null;
   render();
-  showToast(id ? 'Данные сотрудника сохранены.' : 'Сотрудник добавлен. Сохраните выданный код — его нельзя посмотреть повторно.');
+  showToast(id ? 'Данные сотрудника сохранены.' : 'Сотрудник добавлен. Код доступен в панели администратора.');
+}
+
+function csvCell(value) {
+  return `"${String(value ?? '').replaceAll('"', '""')}"`;
+}
+
+function exportHistory() {
+  if (!state.historyRows.length) return;
+  const rows = [
+    ['Дата', 'Сотрудник', 'В смене', 'Работа', 'Перерыв', 'Сон', 'Количество смен'],
+    ...state.historyRows.map((row) => [
+      formatHistoryDate(row.date),
+      `${row.firstName} ${row.lastName}`,
+      historyTimeRange(row),
+      historyDuration(row.workMs),
+      historyDuration(row.breakMs),
+      historyDuration(row.sleepMs),
+      row.shiftCount
+    ])
+  ];
+  const csv = `${String.fromCharCode(0xFEFF)}${rows.map((row) => row.map(csvCell).join(';')).join('\r\n')}`;
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = `история-смен-${state.historyFrom}-${state.historyTo}.csv`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+async function loadShiftHistory() {
+  if (!state.adminAuthenticated) return;
+  state.historyLoading = true;
+  if (state.view === 'history') render();
+  try {
+    const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+    const rows = await rpc('admin_shift_history', { p_from: state.historyFrom, p_to: state.historyTo, p_timezone: timezone });
+    state.historyRows = Array.isArray(rows) ? rows : [];
+  } finally {
+    state.historyLoading = false;
+    if (state.view === 'history') render();
+  }
+}
+
+async function saveNotepad(form) {
+  const content = form.elements.content.value;
+  data.notepad = await rpc('save_admin_notepad', { p_content: content });
+  render();
+  showToast('Заметка сохранена.');
 }
 
 async function refreshAdminData({ quiet = false } = {}) {
@@ -502,16 +686,16 @@ async function refreshAdminData({ quiet = false } = {}) {
   const { data: sessionData } = await supabaseClient.auth.getSession();
   if (!sessionData.session) {
     state.adminAuthenticated = false;
-    if (state.view === 'admin') render();
+    if (isAdminView()) render();
     return;
   }
   try {
     data = await rpc('admin_dashboard');
     state.adminAuthenticated = true;
-    if (state.view === 'admin') render();
+    if (isAdminView()) render();
   } catch (error) {
     state.adminAuthenticated = false;
-    if (state.view === 'admin') render();
+    if (isAdminView()) render();
     if (!quiet) showToast(error.message, 'error');
   }
 }
@@ -540,7 +724,12 @@ document.addEventListener('click', (event) => {
     state.view = viewButton.dataset.view;
     state.codeValue = '';
     render();
-    if (state.view === 'admin') run(() => refreshAdminData());
+    if (isAdminView()) {
+      run(async () => {
+        await refreshAdminData();
+        if (state.view === 'history' && state.adminAuthenticated) await loadShiftHistory();
+      });
+    }
     if (state.view === 'terminal' && state.employeeToken) run(() => refreshEmployeeSession({ quiet: true }));
     return;
   }
@@ -563,6 +752,12 @@ document.addEventListener('click', (event) => {
     state.codeValue = '';
     render();
   }
+  if (action === 'return-to-code') {
+    clearEmployeeSession();
+    state.view = 'terminal';
+    render();
+  }
+  if (action === 'export-history') exportHistory();
   if (action === 'logout-admin') {
     run(async () => {
       await supabaseClient.auth.signOut();
@@ -603,6 +798,22 @@ document.addEventListener('submit', (event) => {
     event.preventDefault();
     run(() => handleCloseCode(event.target));
   }
+  if (event.target.id === 'history-filter-form') {
+    event.preventDefault();
+    const from = event.target.elements.from.value;
+    const to = event.target.elements.to.value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to) || from > to) {
+      showToast('Укажите корректный период.', 'error');
+      return;
+    }
+    state.historyFrom = from;
+    state.historyTo = to;
+    run(() => loadShiftHistory());
+  }
+  if (event.target.id === 'notepad-form') {
+    event.preventDefault();
+    run(() => saveNotepad(event.target));
+  }
   if (event.target.id === 'admin-login-form') {
     event.preventDefault();
     const email = event.target.elements.email.value.trim();
@@ -611,6 +822,7 @@ document.addEventListener('submit', (event) => {
       const { error } = await supabaseClient.auth.signInWithPassword({ email, password });
       if (error) throw new Error(error.message || 'Не удалось войти в панель.');
       await refreshAdminData();
+      if (state.view === 'history' && state.adminAuthenticated) await loadShiftHistory();
     });
   }
 });
